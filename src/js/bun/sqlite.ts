@@ -122,6 +122,8 @@ interface CppSQL {
   fcntl(handle: TODO, ...args: TODO[]): TODO;
   close(handle: TODO, throwOnError: boolean): void;
   setCustomSQLite(path: string): void;
+  createFunction(handle: TODO, name: string, fn: Function, options?: TODO): void;
+  createAggregate(handle: TODO, name: string, options: TODO): void;
 }
 
 let SQL: CppSQL;
@@ -495,6 +497,53 @@ class Database implements SqliteTypes.Database {
     }
 
     return SQL.fcntl(handle, ...arguments);
+  }
+
+  createFunction(
+    name: string,
+    fn: Function,
+    options?: { deterministic?: boolean; directOnly?: boolean; varargs?: boolean; safeIntegers?: boolean },
+  ): this {
+    if (typeof name !== "string" || name.length === 0) {
+      throw new TypeError("Expected a non-empty string as function name");
+    }
+    if (typeof fn !== "function") {
+      throw new TypeError("Expected a function as second argument");
+    }
+    SQL.createFunction(this.#handle, name, fn, options);
+    return this;
+  }
+
+  createAggregate(
+    name: string,
+    options: {
+      step: Function;
+      start?: any;
+      result?: Function;
+      inverse?: Function;
+      deterministic?: boolean;
+      directOnly?: boolean;
+      varargs?: boolean;
+      safeIntegers?: boolean;
+    },
+  ): this {
+    if (typeof name !== "string" || name.length === 0) {
+      throw new TypeError("Expected a non-empty string as function name");
+    }
+    if (!options || typeof options !== "object") {
+      throw new TypeError("Expected an options object as second argument");
+    }
+    if (typeof options.step !== "function") {
+      throw new TypeError("options.step must be a function");
+    }
+    if (options.result !== undefined && typeof options.result !== "function") {
+      throw new TypeError("options.result must be a function");
+    }
+    if (options.inverse !== undefined && typeof options.inverse !== "function") {
+      throw new TypeError("options.inverse must be a function");
+    }
+    SQL.createAggregate(this.#handle, name, options);
+    return this;
   }
 
   close(throwOnError = false) {

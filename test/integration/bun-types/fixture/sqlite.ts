@@ -50,3 +50,11 @@ insertManyCats([
   // @ts-expect-error - Should fail
   { fail: true },
 ]);
+
+// createFunction type tests
+const chainResult = db.createFunction("add", (a: number, b: number) => a + b);
+expectType<typeof db>(chainResult);
+
+db.createFunction("upper", (s: string) => s.toUpperCase(), { deterministic: true });
+db.createFunction("noop", () => null, { directOnly: true });
+db.createFunction("variadic", (...args: number[]) => args.reduce((a, b) => a + b, 0), { varargs: true });

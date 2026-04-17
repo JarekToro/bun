@@ -563,6 +563,132 @@ declare module "bun:sqlite" {
      * @link https://www.sqlite.org/c3ref/file_control.html
      */
     fileControl(zDbName: string, op: number, arg?: ArrayBufferView | number): number;
+
+    /**
+     * Register a user-defined scalar SQL function.
+     *
+     * The function will be available to use in SQL queries executed against this database.
+     * The registered function persists for the lifetime of the database connection.
+     *
+     * Calling `createFunction` with the same name a second time replaces the previous
+     * registration.
+     *
+     * @param name The SQL function name (case-insensitive).
+     * @param fn The JavaScript function to call when the SQL function is invoked.
+     *   Receives the SQL arguments as JS values and should return a value that can be
+     *   mapped back to SQLite (number, string, Uint8Array / Buffer, bigint, boolean,
+     *   null, or undefined).
+     * @param options Optional configuration:
+     *   - `deterministic` – hint to SQLite that the function always returns the same
+     *     result for the same inputs (enables query-planner optimizations). Default: `false`.
+     *   - `directOnly` – prevent the function from being used inside triggers or views.
+     *     Default: `false`.
+     *   - `varargs` – when `true`, SQLite allows any number of arguments regardless of
+     *     the function's declared `.length`. Default: `false` (arity derived from
+     *     `fn.length`).
+     *   - `safeIntegers` – when `true`, `INTEGER` arguments are passed as `bigint` instead
+     *     of `number`, preserving full 64-bit precision. Default: `false`.
+     * @returns The `Database` instance (for chaining).
+     *
+     * @example
+     * ```ts
+     * import { Database } from "bun:sqlite";
+     * const db = new Database(":memory:");
+     *
+     * db.createFunction("add", (a, b) => a + b);
+     * db.query("SELECT add(1, 2) as result").get(); // => { result: 3 }
+     *
+     * db.createFunction("upper", (s) => String(s).toUpperCase(), { deterministic: true });
+     * db.query("SELECT upper('hello') as result").get(); // => { result: 'HELLO' }
+     * ```
+     */
+    createFunction(
+      name: string,
+      fn: (...args: SQLQueryBindings[]) => SQLQueryBindings,
+      options?: {
+        /** If true, SQLite may use the function in query-plan optimizations. Default: false. */
+        deterministic?: boolean;
+        /** If true, the function cannot be called from triggers or views. Default: false. */
+        directOnly?: boolean;
+        /**
+         * If true, the function accepts any number of arguments regardless of `fn.length`.
+         * Default: false.
+         */
+        varargs?: boolean;
+        /**
+         * If true, INTEGER arguments are passed as `bigint` instead of `number`.
+         * Default: false.
+         */
+        safeIntegers?: boolean;
+      },
+    ): this;
+
+    /**
+     * Register a user-defined aggregate SQL function.
+     *
+     * Aggregate functions process a set of rows and reduce them to a single value
+     * (e.g. `SUM`, `AVG`). When `options.inverse` is also provided the aggregate
+     * can be used as a *window function*.
+     *
+     * @param name The SQL function name (case-insensitive).
+     * @param options Configuration:
+     *   - `step` *(required)* – called once per row. Receives `(accumulator, ...sqlArgs)`.
+     *     If it returns a non-`undefined` value the accumulator is replaced; otherwise the
+     *     previous accumulator (possibly mutated in-place) is kept.
+     *   - `start` – initial value of the accumulator. If it is a function it is called
+     *     with no arguments at the start of each aggregation to produce a fresh initial
+     *     value; otherwise the value is used as-is (shared across calls). Defaults to
+     *     `null`.
+     *   - `result` – called with the final accumulator to produce the SQL result value.
+     *     If omitted the accumulator itself is returned.
+     *   - `inverse` – called with `(accumulator, ...sqlArgs)` to *remove* a previously
+     *     added row from the window. Providing this option enables the function to be
+     *     used as a window function (`OVER (...)`).
+     *   - `deterministic`, `directOnly`, `varargs`, `safeIntegers` – same meaning as for
+     *     {@link createFunction}.
+     * @returns The `Database` instance (for chaining).
+     *
+     * @example
+     * ```ts
+     * import { Database } from "bun:sqlite";
+     * const db = new Database(":memory:");
+     *
+     * // Basic aggregate: sum all values
+     * db.createAggregate("addAll", {
+     *   start: 0,
+     *   step: (total, value) => total + value,
+     * });
+     * db.query("SELECT addAll(n) FROM (VALUES (1),(2),(3))").pluck().get(); // => 6
+     *
+     * // Window function aggregate
+     * db.createAggregate("runningSum", {
+     *   start: 0,
+     *   step: (total, value) => total + value,
+     *   inverse: (total, value) => total - value,
+     * });
+     * ```
+     */
+    createAggregate(
+      name: string,
+      options: {
+        /** Called once per row: (accumulator, ...sqlArgs) => newAccumulator | void */
+        step: (accumulator: SQLQueryBindings, ...args: SQLQueryBindings[]) => SQLQueryBindings | void;
+        /** Initial accumulator value or factory function returning the initial value. Default: null. */
+        start?: SQLQueryBindings | (() => SQLQueryBindings);
+        /** Transforms the final accumulator into the SQL result. */
+        result?: (accumulator: SQLQueryBindings) => SQLQueryBindings;
+        /** Removes a row from the window: (accumulator, ...sqlArgs) => newAccumulator | void */
+        inverse?: (accumulator: SQLQueryBindings, ...args: SQLQueryBindings[]) => SQLQueryBindings | void;
+        /** If true, SQLite may use the function in query-plan optimizations. Default: false. */
+        deterministic?: boolean;
+        /** If true, the function cannot be called from triggers or views. Default: false. */
+        directOnly?: boolean;
+        /** If true, the function accepts any number of arguments. Default: false. */
+        varargs?: boolean;
+        /** If true, INTEGER arguments are passed as `bigint`. Default: false. */
+        safeIntegers?: boolean;
+      },
+    ): this;
   }
 
   /**
