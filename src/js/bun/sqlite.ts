@@ -122,6 +122,7 @@ interface CppSQL {
   fcntl(handle: TODO, ...args: TODO[]): TODO;
   close(handle: TODO, throwOnError: boolean): void;
   setCustomSQLite(path: string): void;
+  createFunction(handle: TODO, name: string, fn: Function, options?: TODO): void;
 }
 
 let SQL: CppSQL;
@@ -495,6 +496,17 @@ class Database implements SqliteTypes.Database {
     }
 
     return SQL.fcntl(handle, ...arguments);
+  }
+
+  createFunction(name: string, fn: Function, options?: { deterministic?: boolean; directOnly?: boolean; varargs?: boolean }): this {
+    if (typeof name !== "string" || name.length === 0) {
+      throw new TypeError("Expected a non-empty string as function name");
+    }
+    if (typeof fn !== "function") {
+      throw new TypeError("Expected a function as second argument");
+    }
+    SQL.createFunction(this.#handle, name, fn, options);
+    return this;
   }
 
   close(throwOnError = false) {

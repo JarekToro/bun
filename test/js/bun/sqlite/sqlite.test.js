@@ -1494,3 +1494,150 @@ it("#13082", async () => {
 
   await Promise.allSettled(runs);
 });
+
+// ---- User-Defined Functions (UDF) tests ----
+
+describe("createFunction", () => {
+  it("registers a basic scalar function", () => {
+    const db = new Database(":memory:");
+    db.createFunction("add", (a, b) => a + b);
+    const row = db.query("SELECT add(3, 4) as result").get();
+    expect(row.result).toBe(7);
+  });
+
+  it("returns `this` for chaining", () => {
+    const db = new Database(":memory:");
+    const ret = db.createFunction("noop", () => null);
+    expect(ret).toBe(db);
+  });
+
+  it("works with string arguments and returns", () => {
+    const db = new Database(":memory:");
+    db.createFunction("myupper", s => String(s).toUpperCase());
+    const row = db.query("SELECT myupper('hello') as result").get();
+    expect(row.result).toBe("HELLO");
+  });
+
+  it("works with no arguments (zero-arity)", () => {
+    const db = new Database(":memory:");
+    db.createFunction("fortytwo", () => 42);
+    const row = db.query("SELECT fortytwo() as result").get();
+    expect(row.result).toBe(42);
+  });
+
+  it("returns null for undefined / null", () => {
+    const db = new Database(":memory:");
+    db.createFunction("retNull", () => null);
+    db.createFunction("retUndefined", () => undefined);
+    expect(db.query("SELECT retNull() as v").get().v).toBeNull();
+    expect(db.query("SELECT retUndefined() as v").get().v).toBeNull();
+  });
+
+  it("returns a boolean as an integer", () => {
+    const db = new Database(":memory:");
+    db.createFunction("isEven", n => n % 2 === 0);
+    const row = db.query("SELECT isEven(4) as a, isEven(3) as b").get();
+    expect(row.a).toBe(1);
+    expect(row.b).toBe(0);
+  });
+
+  it("returns a Uint8Array as a blob", () => {
+    const db = new Database(":memory:");
+    db.createFunction("makeBlob", () => new Uint8Array([1, 2, 3]));
+    const row = db.query("SELECT makeBlob() as v").get();
+    expect(row.v).toBeInstanceOf(Uint8Array);
+    expect(row.v).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it("converts incoming integer SQL values to JS numbers", () => {
+    const db = new Database(":memory:");
+    const received = [];
+    db.createFunction("capture", (...args) => {
+      received.push(...args);
+      return null;
+    }, { varargs: true });
+    db.query("SELECT capture(1, 2, 3)").run();
+    expect(received).toEqual([1, 2, 3]);
+  });
+
+  it("converts incoming text SQL values to JS strings", () => {
+    const db = new Database(":memory:");
+    let got;
+    db.createFunction("captureStr", s => { got = s; return s; });
+    db.query("SELECT captureStr('hello') as v").get();
+    expect(got).toBe("hello");
+    expect(typeof got).toBe("string");
+  });
+
+  it("converts incoming null SQL value to JS null", () => {
+    const db = new Database(":memory:");
+    let got = "sentinel";
+    db.createFunction("captureNull", v => { got = v; return null; });
+    db.query("SELECT captureNull(NULL)").run();
+    expect(got).toBeNull();
+  });
+
+  it("varargs option allows arbitrary argument count", () => {
+    const db = new Database(":memory:");
+    db.createFunction("sum_all", (...args) => args.reduce((a, b) => a + b, 0), { varargs: true });
+    expect(db.query("SELECT sum_all(1,2,3,4,5) as v").get().v).toBe(15);
+    expect(db.query("SELECT sum_all(10) as v").get().v).toBe(10);
+    expect(db.query("SELECT sum_all() as v").get().v).toBe(0);
+  });
+
+  it("deterministic option does not change behaviour for basic usage", () => {
+    const db = new Database(":memory:");
+    db.createFunction("double", n => n * 2, { deterministic: true });
+    expect(db.query("SELECT double(5) as v").get().v).toBe(10);
+  });
+
+  it("replaces a previously registered function when called again with the same name", () => {
+    const db = new Database(":memory:");
+    db.createFunction("greet", () => "hello");
+    expect(db.query("SELECT greet() as v").get().v).toBe("hello");
+    db.createFunction("greet", () => "world");
+    expect(db.query("SELECT greet() as v").get().v).toBe("world");
+  });
+
+  it("propagates JS errors as SQLite errors", () => {
+    const db = new Database(":memory:");
+    db.createFunction("boom", () => { throw new Error("custom error"); });
+    expect(() => db.query("SELECT boom()").run()).toThrow();
+  });
+
+  it("throws TypeError for non-string name", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createFunction(42, () => {})).toThrow(TypeError);
+  });
+
+  it("throws TypeError for empty name", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createFunction("", () => {})).toThrow(TypeError);
+  });
+
+  it("throws TypeError for non-function callback", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createFunction("f", "not a function")).toThrow(TypeError);
+  });
+
+  it("works inside queries after close does not crash (no-op on closed db — different stmt should throw)", () => {
+    const db = new Database(":memory:");
+    db.createFunction("add1", x => x + 1);
+    const stmt = db.query("SELECT add1(10) as v");
+    // Function should work before close
+    expect(stmt.get().v).toBe(11);
+    db.close();
+    // Querying after close should throw (not crash)
+    expect(() => stmt.get()).toThrow();
+  });
+
+  it("function can be used across multiple queries", () => {
+    const db = new Database(":memory:");
+    db.createFunction("square", x => x * x);
+    db.exec("CREATE TABLE nums (n INTEGER)");
+    db.exec("INSERT INTO nums VALUES (2), (3), (4)");
+    const rows = db.query("SELECT square(n) as sq FROM nums").all();
+    expect(rows).toEqual([{ sq: 4 }, { sq: 9 }, { sq: 16 }]);
+  });
+});
+

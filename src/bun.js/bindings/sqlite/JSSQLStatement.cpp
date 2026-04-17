@@ -291,6 +291,8 @@ JSC_DECLARE_HOST_FUNCTION(jsSQLStatementSetPrototypeFunction);
 JSC_DECLARE_HOST_FUNCTION(jsSQLStatementFunctionFinalize);
 JSC_DECLARE_HOST_FUNCTION(jsSQLStatementToStringFunction);
 
+JSC_DECLARE_HOST_FUNCTION(jsSQLStatementCreateFunctionFunction);
+
 JSC_DECLARE_CUSTOM_GETTER(jsSqlStatementGetColumnNames);
 JSC_DECLARE_CUSTOM_GETTER(jsSqlStatementGetColumnCount);
 JSC_DECLARE_CUSTOM_GETTER(jsSqlStatementGetParamCount);
@@ -333,6 +335,171 @@ static JSValue createSQLiteError(JSC::JSGlobalObject* globalObject, sqlite3* db)
 
     return object;
 }
+
+// ---- User-Defined Functions (UDF) support ----
+
+struct SQLiteUDFData {
+    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(SQLiteUDFData);
+
+    JSC::Strong<JSC::JSObject> m_function;
+    JSC::Strong<Zig::GlobalObject> m_globalObject;
+
+    SQLiteUDFData(JSC::JSObject* function, Zig::GlobalObject* globalObject)
+        : m_function(globalObject->vm(), function)
+        , m_globalObject(globalObject->vm(), globalObject)
+    {
+    }
+};
+
+// Convert a sqlite3_value* to a JSValue
+static JSC::JSValue sqliteValueToJS(JSC::VM& vm, JSC::JSGlobalObject* globalObject, sqlite3_value* value)
+{
+    switch (sqlite3_value_type(value)) {
+    case SQLITE_INTEGER:
+        return JSC::jsNumber(sqlite3_value_int64(value));
+    case SQLITE_FLOAT:
+        return JSC::jsNumber(sqlite3_value_double(value));
+    case SQLITE3_TEXT: {
+        size_t len = sqlite3_value_bytes(value);
+        const unsigned char* text = sqlite3_value_text(value);
+        if (!text || len == 0)
+            return JSC::jsEmptyString(vm);
+        return JSC::jsString(vm, WTF::String::fromUTF8({ text, len }));
+    }
+    case SQLITE_BLOB: {
+        size_t len = sqlite3_value_bytes(value);
+        const void* blob = sqlite3_value_blob(value);
+        if (!blob || len == 0) {
+            auto* array = JSC::JSUint8Array::create(globalObject, globalObject->m_typedArrayUint8.get(globalObject), 0);
+            return array ? array : JSC::jsNull();
+        }
+        auto* array = JSC::JSUint8Array::createUninitialized(globalObject, globalObject->m_typedArrayUint8.get(globalObject), len);
+        if (!array)
+            return JSC::jsNull();
+        memcpy(array->vector(), blob, len);
+        return array;
+    }
+    case SQLITE_NULL:
+    default:
+        return JSC::jsNull();
+    }
+}
+
+// Convert a JSValue to a sqlite3 result
+static void jsValueToSQLiteResult(sqlite3_context* context, JSC::JSValue value, JSC::VM& vm, JSC::JSGlobalObject* globalObject)
+{
+    if (value.isNull() || value.isUndefined()) {
+        sqlite3_result_null(context);
+    } else if (value.isBoolean()) {
+        sqlite3_result_int(context, value.toBoolean(globalObject) ? 1 : 0);
+    } else if (value.isAnyInt()) {
+        sqlite3_result_int64(context, value.asAnyInt());
+    } else if (value.isNumber()) {
+        sqlite3_result_double(context, value.asDouble());
+    } else if (value.isHeapBigInt()) {
+        sqlite3_result_int64(context, JSBigInt::toBigInt64(value));
+    } else if (value.isString()) {
+        auto* str = value.toStringOrNull(globalObject);
+        if (!str) {
+            sqlite3_result_null(context);
+            return;
+        }
+        auto view = str->view(globalObject);
+        if (view->is8Bit() && view->containsOnlyASCII()) {
+            sqlite3_result_text(context, reinterpret_cast<const char*>(view->span8().data()), view->length(), SQLITE_TRANSIENT);
+        } else {
+            auto utf8 = view->utf8();
+            sqlite3_result_text(context, utf8.data(), utf8.length(), SQLITE_TRANSIENT);
+        }
+    } else if (auto* view = jsDynamicCast<JSC::JSArrayBufferView*>(value)) {
+        if (view->isDetached()) {
+            sqlite3_result_null(context);
+        } else {
+            sqlite3_result_blob(context, view->vector(), view->byteLength(), SQLITE_TRANSIENT);
+        }
+    } else {
+        sqlite3_result_null(context);
+    }
+}
+
+// C callback invoked by SQLite for each UDF call
+static void sqlite_udf_scalar_callback(sqlite3_context* context, int argc, sqlite3_value** argv)
+{
+    auto* data = static_cast<SQLiteUDFData*>(sqlite3_user_data(context));
+    ASSERT(data);
+
+    auto* globalObject = data->m_globalObject.get();
+    if (!globalObject) {
+        sqlite3_result_error(context, "SQLite UDF: global object has been garbage collected", -1);
+        return;
+    }
+
+    auto& vm = globalObject->vm();
+    auto throwScope = DECLARE_THROW_SCOPE(vm);
+
+    // Build the JS argument list
+    MarkedArgumentBuffer args;
+    args.ensureCapacity(argc);
+    for (int i = 0; i < argc; i++) {
+        JSC::JSValue jsArg = sqliteValueToJS(vm, globalObject, argv[i]);
+        if (throwScope.exception()) {
+            throwScope.clearException();
+            sqlite3_result_error(context, "SQLite UDF: error converting argument to JS value", -1);
+            return;
+        }
+        args.append(jsArg);
+    }
+
+    auto* fn = data->m_function.get();
+    if (!fn) {
+        sqlite3_result_error(context, "SQLite UDF: callback function has been garbage collected", -1);
+        return;
+    }
+
+    auto callData = JSC::getCallData(fn);
+    if (callData.type == JSC::CallData::Type::None) {
+        sqlite3_result_error(context, "SQLite UDF: callback is not callable", -1);
+        return;
+    }
+
+    JSC::JSValue result = JSC::call(globalObject, fn, callData, JSC::jsUndefined(), args);
+
+    if (throwScope.exception()) {
+        // Extract the error message and pass it to SQLite
+        JSC::Exception* exception = throwScope.exception();
+        JSC::JSValue exceptionValue = exception->value();
+        throwScope.clearException();
+
+        WTF::String msg;
+        if (auto* str = exceptionValue.toStringOrNull(globalObject)) {
+            throwScope.clearException();
+            msg = str->value(globalObject);
+            throwScope.clearException();
+        }
+
+        if (msg.isEmpty())
+            msg = "SQLite UDF threw an error"_s;
+
+        auto utf8 = msg.utf8();
+        sqlite3_result_error(context, utf8.data(), static_cast<int>(utf8.length()));
+        return;
+    }
+
+    // Clear any "soft" exceptions that may have occurred during argument conversion
+    throwScope.clearException();
+    jsValueToSQLiteResult(context, result, vm, globalObject);
+    // Ignore any exceptions from result conversion; SQLite will surface the error via the result code
+    throwScope.clearException();
+}
+
+// Called by SQLite when the UDF is being removed (DB closed or function overridden)
+static void sqlite_udf_destroy(void* pApp)
+{
+    auto* data = static_cast<SQLiteUDFData*>(pApp);
+    delete data;
+}
+
+// ---- End UDF support ----
 
 class SQLiteBindingsMap {
 public:
@@ -1841,6 +2008,145 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementFcntlFunction, (JSC::JSGlobalObject * lex
     return JSValue::encode(jsNumber(statusCode));
 }
 
+// Register a user-defined scalar function with a SQLite database.
+// Arguments: (dbHandle: number, name: string, fn: Function, options?: { deterministic?: boolean, directOnly?: boolean, varargs?: boolean })
+JSC_DEFINE_HOST_FUNCTION(jsSQLStatementCreateFunctionFunction, (JSC::JSGlobalObject* lexicalGlobalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = JSC::getVM(lexicalGlobalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSValue thisValue = callFrame->thisValue();
+    JSSQLStatementConstructor* thisObject = jsDynamicCast<JSSQLStatementConstructor*>(thisValue.getObject());
+    if (!thisObject) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Expected SQLStatement"_s));
+        return {};
+    }
+
+    if (callFrame->argumentCount() < 3) {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Expected at least 3 arguments"_s));
+        return {};
+    }
+
+    // Argument 0: database handle
+    JSValue dbNumberValue = callFrame->argument(0);
+    if (!dbNumberValue.isNumber()) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Expected number as database handle"_s));
+        return {};
+    }
+    int dbIndex = dbNumberValue.toInt32(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    if (dbIndex < 0 || dbIndex >= static_cast<int>(databases().size())) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Invalid database handle"_s));
+        return {};
+    }
+
+    sqlite3* db = databases()[dbIndex]->db;
+    if (!db) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Database has been closed"_s));
+        return {};
+    }
+
+    // Argument 1: function name
+    JSValue nameValue = callFrame->argument(1);
+    if (!nameValue.isString()) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createTypeError(lexicalGlobalObject, "Expected string as function name"_s));
+        return {};
+    }
+    auto nameStr = nameValue.toWTFString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    if (nameStr.isEmpty()) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createTypeError(lexicalGlobalObject, "Function name must not be empty"_s));
+        return {};
+    }
+
+    // Argument 2: callback function
+    JSValue callbackValue = callFrame->argument(2);
+    if (!callbackValue.isObject()) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createTypeError(lexicalGlobalObject, "Expected function as callback"_s));
+        return {};
+    }
+    JSC::CallData callData = JSC::getCallData(callbackValue);
+    if (callData.type == JSC::CallData::Type::None) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createTypeError(lexicalGlobalObject, "Expected function as callback"_s));
+        return {};
+    }
+
+    // Argument 3: options (optional)
+    int nArg = -1; // default: variadic (accepts any number of args)
+    int sqliteFlags = SQLITE_UTF8;
+    bool deterministic = false;
+    bool directOnly = false;
+    bool varargs = false;
+
+    if (callFrame->argumentCount() > 3) {
+        JSValue optionsValue = callFrame->argument(3);
+        if (optionsValue.isObject()) {
+            JSObject* options = optionsValue.getObject();
+
+            JSValue deterministicValue = options->get(lexicalGlobalObject, Identifier::fromString(vm, "deterministic"_s));
+            RETURN_IF_EXCEPTION(scope, {});
+            if (!deterministicValue.isUndefined())
+                deterministic = deterministicValue.toBoolean(lexicalGlobalObject);
+
+            JSValue directOnlyValue = options->get(lexicalGlobalObject, Identifier::fromString(vm, "directOnly"_s));
+            RETURN_IF_EXCEPTION(scope, {});
+            if (!directOnlyValue.isUndefined())
+                directOnly = directOnlyValue.toBoolean(lexicalGlobalObject);
+
+            JSValue varargsValue = options->get(lexicalGlobalObject, Identifier::fromString(vm, "varargs"_s));
+            RETURN_IF_EXCEPTION(scope, {});
+            if (!varargsValue.isUndefined())
+                varargs = varargsValue.toBoolean(lexicalGlobalObject);
+        }
+    }
+
+    if (deterministic)
+        sqliteFlags |= SQLITE_DETERMINISTIC;
+    if (directOnly)
+        sqliteFlags |= SQLITE_DIRECTONLY;
+
+    // If varargs is not requested, derive nArg from the function's .length property
+    if (!varargs) {
+        JSValue lengthValue = callbackValue.getObject()->get(lexicalGlobalObject, vm.propertyNames->length);
+        RETURN_IF_EXCEPTION(scope, {});
+        if (lengthValue.isNumber()) {
+            double len = lengthValue.asNumber();
+            if (len >= 0 && len <= 127)
+                nArg = static_cast<int>(len);
+        }
+    }
+
+    auto* globalObject = jsDynamicCast<Zig::GlobalObject*>(lexicalGlobalObject);
+    if (!globalObject) [[unlikely]] {
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, "Unexpected global object type"_s));
+        return {};
+    }
+
+    auto* udfData = new SQLiteUDFData(callbackValue.getObject(), globalObject);
+
+    auto nameUtf8 = nameStr.utf8();
+    int rc = sqlite3_create_function_v2(
+        db,
+        nameUtf8.data(),
+        nArg,
+        sqliteFlags,
+        udfData,
+        sqlite_udf_scalar_callback,
+        nullptr, // xStep (aggregate — not supported)
+        nullptr, // xFinal (aggregate — not supported)
+        sqlite_udf_destroy);
+
+    if (rc != SQLITE_OK) {
+        // sqlite3_create_function_v2 does NOT call xDestroy on failure, so we must free the data.
+        delete udfData;
+        throwException(lexicalGlobalObject, scope, createError(lexicalGlobalObject, WTF::String::fromUTF8(sqlite3_errmsg(db))));
+        return {};
+    }
+
+    RELEASE_AND_RETURN(scope, JSValue::encode(jsUndefined()));
+}
+
 /* Hash table for constructor */
 static const HashTableValue JSSQLStatementConstructorTableValues[] = {
     { "open"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsSQLStatementOpenStatementFunction, 2 } },
@@ -1853,6 +2159,7 @@ static const HashTableValue JSSQLStatementConstructorTableValues[] = {
     { "serialize"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsSQLStatementSerialize, 1 } },
     { "deserialize"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsSQLStatementDeserialize, 2 } },
     { "fcntl"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsSQLStatementFcntlFunction, 2 } },
+    { "createFunction"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsSQLStatementCreateFunctionFunction, 3 } },
 };
 
 const ClassInfo JSSQLStatementConstructor::s_info = { "SQLStatement"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSSQLStatementConstructor) };

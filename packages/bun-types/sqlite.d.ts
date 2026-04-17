@@ -563,6 +563,58 @@ declare module "bun:sqlite" {
      * @link https://www.sqlite.org/c3ref/file_control.html
      */
     fileControl(zDbName: string, op: number, arg?: ArrayBufferView | number): number;
+
+    /**
+     * Register a user-defined scalar SQL function.
+     *
+     * The function will be available to use in SQL queries executed against this database.
+     * The registered function persists for the lifetime of the database connection.
+     *
+     * Calling `createFunction` with the same name a second time replaces the previous
+     * registration.
+     *
+     * @param name The SQL function name (case-insensitive).
+     * @param fn The JavaScript function to call when the SQL function is invoked.
+     *   Receives the SQL arguments as JS values and should return a value that can be
+     *   mapped back to SQLite (number, string, Uint8Array / Buffer, bigint, boolean,
+     *   null, or undefined).
+     * @param options Optional configuration:
+     *   - `deterministic` – hint to SQLite that the function always returns the same
+     *     result for the same inputs (enables query-planner optimizations). Default: `false`.
+     *   - `directOnly` – prevent the function from being used inside triggers or views.
+     *     Default: `false`.
+     *   - `varargs` – when `true`, SQLite allows any number of arguments regardless of
+     *     the function's declared `.length`. Default: `false` (arity derived from
+     *     `fn.length`).
+     * @returns The `Database` instance (for chaining).
+     *
+     * @example
+     * ```ts
+     * import { Database } from "bun:sqlite";
+     * const db = new Database(":memory:");
+     *
+     * db.createFunction("add", (a, b) => a + b);
+     * db.query("SELECT add(1, 2) as result").get(); // => { result: 3 }
+     *
+     * db.createFunction("upper", (s) => String(s).toUpperCase(), { deterministic: true });
+     * db.query("SELECT upper('hello') as result").get(); // => { result: 'HELLO' }
+     * ```
+     */
+    createFunction(
+      name: string,
+      fn: (...args: SQLQueryBindings[]) => SQLQueryBindings,
+      options?: {
+        /** If true, SQLite may use the function in query-plan optimizations. Default: false. */
+        deterministic?: boolean;
+        /** If true, the function cannot be called from triggers or views. Default: false. */
+        directOnly?: boolean;
+        /**
+         * If true, the function accepts any number of arguments regardless of `fn.length`.
+         * Default: false.
+         */
+        varargs?: boolean;
+      },
+    ): this;
   }
 
   /**
