@@ -1500,8 +1500,8 @@ it("#13082", async () => {
 describe("createFunction", () => {
   it("registers a basic scalar function", () => {
     const db = new Database(":memory:");
-    db.createFunction("add", (a, b) => a + b);
-    const row = db.query("SELECT add(3, 4) as result").get();
+    db.createFunction("myadd", (a, b) => a + b);
+    const row = db.query("SELECT myadd(3, 4) as result").get();
     expect(row.result).toBe(7);
   });
 

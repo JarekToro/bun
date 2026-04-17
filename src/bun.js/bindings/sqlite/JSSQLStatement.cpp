@@ -339,7 +339,7 @@ static JSValue createSQLiteError(JSC::JSGlobalObject* globalObject, sqlite3* db)
 // ---- User-Defined Functions (UDF) support ----
 
 struct SQLiteUDFData {
-    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(SQLiteUDFData);
+    WTF_DEPRECATED_MAKE_STRUCT_FAST_ALLOCATED(SQLiteUDFData);
 
     JSC::Strong<JSC::JSObject> m_function;
     JSC::Strong<Zig::GlobalObject> m_globalObject;
@@ -349,6 +349,8 @@ struct SQLiteUDFData {
         , m_globalObject(globalObject->vm(), globalObject)
     {
     }
+
+    ~SQLiteUDFData() = default;
 };
 
 // Convert a sqlite3_value* to a JSValue
@@ -399,8 +401,10 @@ static void jsValueToSQLiteResult(sqlite3_context* context, JSC::JSValue value, 
     } else if (value.isHeapBigInt()) {
         sqlite3_result_int64(context, JSBigInt::toBigInt64(value));
     } else if (value.isString()) {
+        auto catchScope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
         auto* str = value.toStringOrNull(globalObject);
-        if (!str) {
+        if (!str || catchScope.exception()) {
+            catchScope.clearExceptionExceptTermination();
             sqlite3_result_null(context);
             return;
         }
@@ -430,21 +434,21 @@ static void sqlite_udf_scalar_callback(sqlite3_context* context, int argc, sqlit
 
     auto* globalObject = data->m_globalObject.get();
     if (!globalObject) {
-        sqlite3_result_error(context, "SQLite UDF: global object has been garbage collected", -1);
+        sqlite3_result_error(context, "SQLite UDF: global object has been collected", -1);
         return;
     }
 
     auto& vm = globalObject->vm();
-    auto throwScope = DECLARE_THROW_SCOPE(vm);
+    auto catchScope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
 
     // Build the JS argument list
     MarkedArgumentBuffer args;
     args.ensureCapacity(argc);
     for (int i = 0; i < argc; i++) {
         JSC::JSValue jsArg = sqliteValueToJS(vm, globalObject, argv[i]);
-        if (throwScope.exception()) {
-            throwScope.clearException();
-            sqlite3_result_error(context, "SQLite UDF: error converting argument to JS value", -1);
+        if (catchScope.exception()) {
+            catchScope.clearExceptionExceptTermination();
+            sqlite3_result_error(context, "SQLite UDF: error converting argument", -1);
             return;
         }
         args.append(jsArg);
@@ -452,7 +456,7 @@ static void sqlite_udf_scalar_callback(sqlite3_context* context, int argc, sqlit
 
     auto* fn = data->m_function.get();
     if (!fn) {
-        sqlite3_result_error(context, "SQLite UDF: callback function has been garbage collected", -1);
+        sqlite3_result_error(context, "SQLite UDF: callback has been collected", -1);
         return;
     }
 
@@ -464,17 +468,16 @@ static void sqlite_udf_scalar_callback(sqlite3_context* context, int argc, sqlit
 
     JSC::JSValue result = JSC::call(globalObject, fn, callData, JSC::jsUndefined(), args);
 
-    if (throwScope.exception()) {
+    if (auto* exception = catchScope.exception()) {
         // Extract the error message and pass it to SQLite
-        JSC::Exception* exception = throwScope.exception();
         JSC::JSValue exceptionValue = exception->value();
-        throwScope.clearException();
+        catchScope.clearExceptionExceptTermination();
 
         WTF::String msg;
         if (auto* str = exceptionValue.toStringOrNull(globalObject)) {
-            throwScope.clearException();
+            catchScope.clearExceptionExceptTermination();
             msg = str->value(globalObject);
-            throwScope.clearException();
+            catchScope.clearExceptionExceptTermination();
         }
 
         if (msg.isEmpty())
@@ -485,11 +488,9 @@ static void sqlite_udf_scalar_callback(sqlite3_context* context, int argc, sqlit
         return;
     }
 
-    // Clear any "soft" exceptions that may have occurred during argument conversion
-    throwScope.clearException();
     jsValueToSQLiteResult(context, result, vm, globalObject);
-    // Ignore any exceptions from result conversion; SQLite will surface the error via the result code
-    throwScope.clearException();
+    // Ignore any exceptions from result conversion
+    catchScope.clearExceptionExceptTermination();
 }
 
 // Called by SQLite when the UDF is being removed (DB closed or function overridden)
