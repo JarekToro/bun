@@ -1639,5 +1639,224 @@ describe("createFunction", () => {
     const rows = db.query("SELECT square(n) as sq FROM nums").all();
     expect(rows).toEqual([{ sq: 4 }, { sq: 9 }, { sq: 16 }]);
   });
+
+  it("safeIntegers option passes integers as BigInt", () => {
+    const db = new Database(":memory:");
+    const received = [];
+    db.createFunction("captureInt", n => { received.push(n); return null; }, { safeIntegers: true });
+    db.query("SELECT captureInt(42)").run();
+    expect(received[0]).toBe(42n);
+  });
+
+  it("safeIntegers preserves full 64-bit integers", () => {
+    const db = new Database(":memory:");
+    const big = 9007199254740993n; // Number.MAX_SAFE_INTEGER + 2
+    let got;
+    db.createFunction("captureBig", n => { got = n; return null; }, { safeIntegers: true });
+    db.exec("CREATE TABLE t (v INTEGER)");
+    db.prepare("INSERT INTO t VALUES (?)").run(big);
+    db.query("SELECT captureBig(v) FROM t").run();
+    expect(got).toBe(big);
+  });
+
+  it("safeIntegers false (default) passes integers as number", () => {
+    const db = new Database(":memory:");
+    let got;
+    db.createFunction("getInt", n => { got = n; return null; });
+    db.query("SELECT getInt(7)").run();
+    expect(typeof got).toBe("number");
+    expect(got).toBe(7);
+  });
+});
+
+describe("createAggregate", () => {
+  it("basic sum aggregate", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("mySum", {
+      start: 0,
+      step: (acc, val) => acc + val,
+    });
+    db.exec("CREATE TABLE t (n INTEGER)");
+    db.exec("INSERT INTO t VALUES (1),(2),(3),(4),(5)");
+    const row = db.query("SELECT mySum(n) AS v FROM t").get();
+    expect(row.v).toBe(15);
+  });
+
+  it("returns this for chaining", () => {
+    const db = new Database(":memory:");
+    const ret = db.createAggregate("noop2", { step: acc => acc });
+    expect(ret).toBe(db);
+  });
+
+  it("start as factory function is called fresh each aggregation", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("collect", {
+      start: () => [],
+      step: (acc, val) => { acc.push(val); return acc; },
+      result: acc => acc.join(","),
+    });
+    db.exec("CREATE TABLE t (n TEXT)");
+    db.exec("INSERT INTO t VALUES ('a'),('b'),('c')");
+    const row = db.query("SELECT collect(n) AS v FROM t").get();
+    expect(row.v).toBe("a,b,c");
+    // Second independent query should produce same result (fresh start)
+    const row2 = db.query("SELECT collect(n) AS v FROM t").get();
+    expect(row2.v).toBe("a,b,c");
+  });
+
+  it("result function transforms the final accumulator", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("myAvg", {
+      start: () => ({ sum: 0, count: 0 }),
+      step: (acc, val) => { acc.sum += val; acc.count++; return acc; },
+      result: acc => acc.count === 0 ? null : acc.sum / acc.count,
+    });
+    db.exec("CREATE TABLE t (n REAL)");
+    db.exec("INSERT INTO t VALUES (1),(2),(3)");
+    const row = db.query("SELECT myAvg(n) AS v FROM t").get();
+    expect(row.v).toBe(2);
+  });
+
+  it("no rows returns start value passed through result", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("myCount", {
+      start: 0,
+      step: (acc) => acc + 1,
+    });
+    db.exec("CREATE TABLE t (n INTEGER)");
+    const row = db.query("SELECT myCount(n) AS v FROM t").get();
+    expect(row.v).toBe(0);
+  });
+
+  it("step returning undefined keeps accumulator unchanged (in-place mutation)", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("collectMutate", {
+      start: () => [],
+      step: (acc, val) => { acc.push(val); /* returns undefined */ },
+      result: acc => acc.length,
+    });
+    db.exec("CREATE TABLE t (n INTEGER)");
+    db.exec("INSERT INTO t VALUES (10),(20),(30)");
+    const row = db.query("SELECT collectMutate(n) AS v FROM t").get();
+    expect(row.v).toBe(3);
+  });
+
+  it("works with null start (default)", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("first", {
+      step: (acc, val) => acc === null ? val : acc,
+    });
+    db.exec("CREATE TABLE t (n INTEGER)");
+    db.exec("INSERT INTO t VALUES (42),(99)");
+    const row = db.query("SELECT first(n) AS v FROM t").get();
+    expect(row.v).toBe(42);
+  });
+
+  it("varargs option allows any number of SQL arguments", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("sumAll", {
+      start: 0,
+      step: (acc, ...vals) => acc + vals.reduce((s, v) => s + v, 0),
+      varargs: true,
+    });
+    const row = db.query("SELECT sumAll(1,2,3,4) AS v").get();
+    expect(row.v).toBe(10);
+  });
+
+  it("JS errors in step propagate as SQLite errors", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("boom", {
+      step: () => { throw new Error("step error"); },
+    });
+    db.exec("CREATE TABLE t (n INTEGER)");
+    db.exec("INSERT INTO t VALUES (1)");
+    expect(() => db.query("SELECT boom(n) FROM t").run()).toThrow();
+  });
+
+  it("JS errors in result propagate as SQLite errors", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("boomResult", {
+      start: 0,
+      step: (acc, val) => acc + val,
+      result: () => { throw new Error("result error"); },
+    });
+    db.exec("CREATE TABLE t (n INTEGER)");
+    db.exec("INSERT INTO t VALUES (1)");
+    expect(() => db.query("SELECT boomResult(n) FROM t").run()).toThrow();
+  });
+
+  it("throws TypeError for non-string name", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createAggregate(42, { step: acc => acc })).toThrow(TypeError);
+  });
+
+  it("throws TypeError for empty name", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createAggregate("", { step: acc => acc })).toThrow(TypeError);
+  });
+
+  it("throws TypeError when step is missing", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createAggregate("bad", {})).toThrow(TypeError);
+  });
+
+  it("throws TypeError when step is not a function", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createAggregate("bad", { step: "not a fn" })).toThrow(TypeError);
+  });
+
+  it("throws TypeError when result is not a function", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createAggregate("bad", { step: acc => acc, result: 42 })).toThrow(TypeError);
+  });
+
+  it("throws TypeError when inverse is not a function", () => {
+    const db = new Database(":memory:");
+    expect(() => db.createAggregate("bad", { step: acc => acc, inverse: 42 })).toThrow(TypeError);
+  });
+
+  it("replaces a previously registered aggregate with the same name", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("myAgg", { start: 0, step: (acc, v) => acc + v });
+    db.exec("CREATE TABLE t (n INTEGER)");
+    db.exec("INSERT INTO t VALUES (1),(2),(3)");
+    expect(db.query("SELECT myAgg(n) AS v FROM t").get().v).toBe(6);
+    // Replace with count
+    db.createAggregate("myAgg", { start: 0, step: (acc) => acc + 1 });
+    expect(db.query("SELECT myAgg(n) AS v FROM t").get().v).toBe(3);
+  });
+
+  it("safeIntegers passes INTEGER rows as BigInt to step", () => {
+    const db = new Database(":memory:");
+    const seen = [];
+    db.createAggregate("collectBig", {
+      start: () => [],
+      step: (acc, val) => { seen.push(val); acc.push(val); return acc; },
+      result: acc => acc.length,
+      safeIntegers: true,
+    });
+    db.exec("CREATE TABLE t (n INTEGER)");
+    db.exec("INSERT INTO t VALUES (1),(2),(3)");
+    db.query("SELECT collectBig(n) FROM t").run();
+    expect(seen.every(v => typeof v === "bigint")).toBe(true);
+  });
+
+  it("window function with inverse computes running sum", () => {
+    const db = new Database(":memory:");
+    db.createAggregate("runSum", {
+      start: 0,
+      step: (acc, val) => acc + val,
+      inverse: (acc, val) => acc - val,
+      result: acc => acc,
+    });
+    db.exec("CREATE TABLE t (id INTEGER, n INTEGER)");
+    db.exec("INSERT INTO t VALUES (1,10),(2,20),(3,30)");
+    const rows = db.query(
+      "SELECT id, runSum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t ORDER BY id"
+    ).all();
+    expect(rows[0].v).toBe(10);
+    expect(rows[1].v).toBe(30);
+    expect(rows[2].v).toBe(50);
+  });
 });
 
